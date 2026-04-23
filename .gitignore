@@ -1,0 +1,11 @@
+# Swift build
+.build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+
+# macOS
+.DS_Store
+*.swp
+
+# Build artifacts
+bin/SwiftFloat

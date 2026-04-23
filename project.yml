@@ -1,0 +1,38 @@
+name: SwiftFloat
+options:
+  bundleIdPrefix: com.qclaw
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: NO
+
+targets:
+  SwiftFloat:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+    resources:
+      - Resources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.qclaw.swiftfloat
+        INFOPLIST_FILE: Resources/Info.plist
+        PRODUCT_NAME: SwiftFloat
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+        COMBINE_HIDPI_IMAGES: YES
+        LSUIElement: YES
+    entitlements:
+      path: Resources/SwiftFloat.entitlements
+      properties:
+        com.apple.security.automation.apple-events: true
