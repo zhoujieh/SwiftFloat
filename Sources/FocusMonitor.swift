@@ -2,26 +2,31 @@ import ApplicationServices
 import AppKit
 
 // MARK: - FocusMonitor
-// 轮询焦点 + AXObserver 监听选中文字变化
+// 检测两种场景显示悬浮框：
+// 1. 划词选中文本 → 显示
+// 2. 输入框只有 "/" → 显示（slash command 模式）
+// 其他情况 → 隐藏
 
 final class FocusMonitor {
     static let shared = FocusMonitor()
 
     private var pollTimer: Timer?
     private var isMonitoring = false
-    private var lastFocusedElementID: CFHashCode?
-    private var lastBundleID: String?
-    private var lastFieldWasEmpty: Bool = false
     private let ownPID = ProcessInfo.processInfo.processIdentifier
 
     var watchedApps: [String] = []
-    var autoShowEnabled = true
     private var suppressHideUntil: Date = .distantPast
 
     // AXObserver 相关
     private var observedElement: AXUIElement?
     private var observer: AXObserver?
     private var observerRunSource: CFRunLoopSource?
+
+    // CGEvent tap（Electron 应用 AX 不可用时检测 "/" 键）
+    private var keyEventTap: CFMachPort?
+    private var keyEventRunSource: CFRunLoopSource?
+    // Electron slash 模式：记录按 "/" 后输入的其他字符数
+    private var slashModeExtraChars: Int = 0
 
     func suppressHide(seconds: TimeInterval) {
         suppressHideUntil = Date().addingTimeInterval(seconds)
@@ -42,9 +47,8 @@ final class FocusMonitor {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return
         }
-        autoShowEnabled = obj["autoShow"] as? Bool ?? true
         watchedApps = obj["apps"] as? [String] ?? []
-        NSLog("[SwiftFloat] apps config loaded: autoShow=\(autoShowEnabled), apps=\(watchedApps)")
+        NSLog("[SwiftFloat] apps config loaded: apps=\(watchedApps)")
     }
 
     func reloadConfig() {
@@ -67,8 +71,11 @@ final class FocusMonitor {
         }
         RunLoop.main.add(pollTimer!, forMode: .common)
 
+        // 启动 CGEvent tap（用于 Electron 应用）
+        startKeyEventTap()
+
         isMonitoring = true
-        NSLog("[SwiftFloat] FocusMonitor started (polling 0.3s + AXObserver).")
+        NSLog("[SwiftFloat] FocusMonitor started (polling 0.3s + CGEventTap).")
     }
 
     func stop() {
@@ -76,13 +83,94 @@ final class FocusMonitor {
         pollTimer = nil
         isMonitoring = false
         removeObserver()
+        stopKeyEventTap()
+    }
+
+    // MARK: - CGEvent Tap (for Electron apps)
+
+    private func startKeyEventTap() {
+        guard keyEventTap == nil else { return }
+
+        let eventMask = (1 << CGEventType.keyDown.rawValue)
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(eventMask),
+            callback: keyEventCallback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else {
+            NSLog("[SwiftFloat] CGEventTapCreate failed - need accessibility permission")
+            return
+        }
+
+        keyEventTap = tap
+        let runSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        keyEventRunSource = runSource
+        CFRunLoopAddSource(CFRunLoopGetMain(), runSource, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+
+        NSLog("[SwiftFloat] CGEvent tap started for keyDown events")
+    }
+
+    private func stopKeyEventTap() {
+        if let tap = keyEventTap {
+            CGEvent.tapEnable(tap: tap, enable: false)
+        }
+        if let source = keyEventRunSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+        keyEventTap = nil
+        keyEventRunSource = nil
+    }
+
+    /// CGEvent tap 回调：检测 "/" 键（Electron 应用用）
+    func handleKeyEvent(_ event: CGEvent) {
+        let activeApp = NSWorkspace.shared.frontmostApplication
+        let bundleID = activeApp?.bundleIdentifier ?? "unknown"
+
+        guard watchedApps.contains(bundleID) else { return }
+
+        let nsEvent = NSEvent(cgEvent: event)
+        let chars = nsEvent?.charactersIgnoringModifiers ?? ""
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+
+        // 检测 "/" 键
+        if chars == "/" || keyCode == 44 {
+            NSLog("[SwiftFloat] Slash key detected in \(bundleID) (Electron)")
+            slashModeExtraChars = 0
+            let position = NSEvent.mouseLocation
+            SnippetStore.shared.switchApp(bundleID)
+            FloatWindowManager.shared.showForSlash(at: position, bundleID: bundleID)
+            return
+        }
+
+        // slash 模式下按了其他键
+        if FloatWindowManager.shared.isSlashMode {
+            // 退格键 (keyCode 51)：减少字符数，如果回退到只有 "/" 则重新显示
+            if keyCode == 51 {
+                slashModeExtraChars = max(0, slashModeExtraChars - 1)
+                if slashModeExtraChars == 0 {
+                    // 回到只有 "/" 的状态，重新显示
+                    let position = NSEvent.mouseLocation
+                    FloatWindowManager.shared.showForSlash(at: position, bundleID: bundleID)
+                }
+                return
+            }
+
+            // 其他可打印键：字段不再只有 "/"，隐藏
+            if !chars.isEmpty {
+                slashModeExtraChars += 1
+                NSLog("[SwiftFloat] Extra char after slash, hiding (extraChars=\(slashModeExtraChars))")
+                FloatWindowManager.shared.hide()
+            }
+        }
     }
 
     // MARK: - Poll
 
     private func pollFocus() {
-        guard autoShowEnabled else { return }
-
+        // 如果鼠标在悬浮框上，不做处理
         if FloatWindowManager.shared.isVisible {
             let mouseLoc = NSEvent.mouseLocation
             if let winFrame = FloatWindowManager.shared.windowFrame, NSMouseInRect(mouseLoc, winFrame, false) {
@@ -100,99 +188,68 @@ final class FocusMonitor {
         )
 
         guard err == .success, let element = focusedElement else {
-            hideIfNeeded()
+            // AX API 失败（Electron 等）— 由 CGEvent tap 处理
+            let activeApp = NSWorkspace.shared.frontmostApplication
+            let bundleID = activeApp?.bundleIdentifier ?? "unknown"
+
+            if !watchedApps.contains(bundleID) {
+                // 非白名单应用 → 隐藏
+                hideIfNeeded()
+            }
+            // 白名单 Electron 应用：由 CGEvent tap 控制，这里不干预
             removeObserver()
             return
         }
 
-        var axElement = (element as! AXUIElement)
+        let axElement = (element as! AXUIElement)
 
-        // 🔧 Electron/Web 应用焦点穿透：如果直接焦点不是文本框，尝试在子元素中找
-        var directRole: CFTypeRef?
-        AXUIElementCopyAttributeValue(axElement, kAXRoleAttribute as CFString, &directRole)
-        let directRoleStr = (directRole as? String) ?? ""
-        var directSubrole: CFTypeRef?
-        AXUIElementCopyAttributeValue(axElement, kAXSubroleAttribute as CFString, &directSubrole)
-        let directSubroleStr = (directSubrole as? String) ?? ""
-        let directIsText = isTextInput(role: directRoleStr, subrole: directSubroleStr, element: axElement)
-
-        // Electron 应用的 wrapper 元素列表
-        let webWrapperRoles = ["AXGroup", "AXScrollArea", "AXWebArea"]
-        let webWrapperSubroles = ["AXWebApplication", "AXWebArea"]
-
-        if !directIsText && (webWrapperRoles.contains(directRoleStr) || webWrapperSubroles.contains(directSubroleStr)) {
-            if let textField = findTextFieldIn(axElement, depth: 0) {
-                var foundRole: CFTypeRef?
-                AXUIElementCopyAttributeValue(textField, kAXRoleAttribute as CFString, &foundRole)
-                NSLog("[SwiftFloat] findTextField: FOUND role=\(foundRole as? String ?? "?") in \(directRoleStr)")
-                axElement = textField
-            } else {
-                NSLog("[SwiftFloat] findTextField: NOT FOUND in \(directRoleStr)")
-            }
-        }
-
+        // 跳过自身
         var elementPID: pid_t = 0
         AXUIElementGetPid(axElement, &elementPID)
         if elementPID == ownPID {
             return
         }
 
-        let elementID = CFHash(axElement)
-
-        var role: CFTypeRef?
-        AXUIElementCopyAttributeValue(axElement, kAXRoleAttribute as CFString, &role)
-        let roleStr = (role as? String) ?? "unknown"
-
-        var subrole: CFTypeRef?
-        AXUIElementCopyAttributeValue(axElement, kAXSubroleAttribute as CFString, &subrole)
-        let subroleStr = (subrole as? String) ?? "none"
-
-        let isText = isTextInput(role: roleStr, subrole: subroleStr, element: axElement)
-
-        // 详细诊断日志：每个焦点都记录（但过滤自身 App）
-        var focusPID: pid_t = 0
-        AXUIElementGetPid(axElement, &focusPID)
-        let focusBundleID = (focusPID > 0) ? (NSRunningApplication(processIdentifier: focusPID)?.bundleIdentifier ?? "unknown") : "unknown"
-        if focusBundleID != "com.apple.SwiftFloat" && focusBundleID != "unknown" {
-            NSLog("[SwiftFloat] pollFocus: bundle=\(focusBundleID) role=\(roleStr) subrole=\(subroleStr) isText=\(isText) pid=\(focusPID)")
-        }
-
-        if isText {
-            var pid: pid_t = 0
-            AXUIElementGetPid(axElement, &pid)
-            let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? "unknown"
-
-            if !watchedApps.isEmpty && !watchedApps.contains(bundleID) {
-                hideIfNeeded()
-                removeObserver()
-                return
-            }
-
-            // 读取输入框当前值（用于判断是否刚清空）
-            let fieldText = getAXValue(axElement)
-            let isEmpty = fieldText.isEmpty
-            let elementChanged = elementID != lastFocusedElementID || bundleID != lastBundleID
-            let emptied = (lastFocusedElementID == elementID) && !lastFieldWasEmpty
-
-            // 显示条件：元素变化 或 刚清空
-            if elementChanged || emptied {
-                lastFocusedElementID = elementID
-                lastBundleID = bundleID
-                lastFieldWasEmpty = isEmpty
-
-                SnippetStore.shared.switchApp(bundleID)
-
-                let position = NSEvent.mouseLocation
-                NSLog("[SwiftFloat] Focus: role=\(roleStr), app=\(bundleID), isEmpty=\(isEmpty), snippets=\(SnippetStore.shared.snippets.count)")
-                FloatWindowManager.shared.show(at: position)
-            }
-
-            // 注册 selection 监听（每次都更新，确保监听正确的元素）
-            installObserverForElement(axElement, id: elementID)
-        } else {
+        // 白名单检查
+        let bundleID = NSRunningApplication(processIdentifier: elementPID)?.bundleIdentifier ?? "unknown"
+        if !watchedApps.isEmpty && !watchedApps.contains(bundleID) {
             hideIfNeeded()
             removeObserver()
+            return
         }
+
+        // 检查是否有选中文本
+        var selectedText: CFTypeRef?
+        let selErr = AXUIElementCopyAttributeValue(axElement, kAXSelectedTextAttribute as CFString, &selectedText)
+
+        if selErr == .success, let text = selectedText as? String, !text.isEmpty {
+            // 有选中文本 → 显示悬浮框
+            NSLog("[SwiftFloat] pollFocus: selection found '\(text.prefix(30))' in \(bundleID)")
+
+            if !FloatWindowManager.shared.isVisible {
+                let position = NSEvent.mouseLocation
+                SnippetStore.shared.switchApp(bundleID)
+                FloatWindowManager.shared.showForSelection(near: position, selectedText: text, bundleID: bundleID)
+            }
+        } else {
+            // 无选中文本，检查输入框是否只有 "/"
+            let fieldText = getAXValue(axElement)
+            if fieldText == "/" {
+                // 输入框恰好只有 "/" → 显示（slash command 模式）
+                NSLog("[SwiftFloat] pollFocus: slash-only detected in \(bundleID)")
+                if !FloatWindowManager.shared.isVisible {
+                    let position = NSEvent.mouseLocation
+                    SnippetStore.shared.switchApp(bundleID)
+                    FloatWindowManager.shared.showForSlash(at: position, bundleID: bundleID)
+                }
+            } else {
+                // 无选中且字段不是只有 "/" → 隐藏
+                hideIfNeeded()
+            }
+        }
+
+        // 注册 AXObserver 监听选中/值变化
+        installObserverForElement(axElement, id: CFHash(axElement))
     }
 
     private func hideIfNeeded() {
@@ -201,8 +258,6 @@ final class FocusMonitor {
         }
 
         if FloatWindowManager.shared.isVisible {
-            lastFocusedElementID = nil
-            lastBundleID = nil
             FloatWindowManager.shared.hide()
         }
     }
@@ -219,8 +274,11 @@ final class FocusMonitor {
 
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
+        var elementPID: pid_t = 0
+        AXUIElementGetPid(element, &elementPID)
+
         var obs: AXObserver? = nil
-        let result = AXObserverCreate(0, axObserverCallback, &obs)
+        let result = AXObserverCreate(elementPID, axObserverCallback, &obs)
 
         guard result == .success, let observer = obs else {
             NSLog("[SwiftFloat] AXObserverCreate failed: \(result.rawValue)")
@@ -240,7 +298,18 @@ final class FocusMonitor {
             return
         }
 
-        // 添加到主 run loop（kCFRunLoopCommonModes 确保各种模式下都能触发）
+        // 监听值变化（检测 "/" 输入）
+        let valueNotifResult = AXObserverAddNotification(
+            observer,
+            element,
+            kAXValueChangedNotification as CFString,
+            selfPtr
+        )
+        if valueNotifResult != .success {
+            NSLog("[SwiftFloat] AXObserverAddNotification (valueChanged) failed: \(valueNotifResult.rawValue)")
+        }
+
+        // 添加到主 run loop
         let runSource = AXObserverGetRunLoopSource(observer)
         CFRunLoopAddSource(CFRunLoopGetMain(), runSource, .commonModes)
 
@@ -254,6 +323,7 @@ final class FocusMonitor {
     private func removeObserver() {
         if let element = observedElement, let obs = observer {
             AXObserverRemoveNotification(obs, element, kAXSelectedTextChangedNotification as CFString)
+            AXObserverRemoveNotification(obs, element, kAXValueChangedNotification as CFString)
         }
         if let source = observerRunSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
@@ -263,99 +333,17 @@ final class FocusMonitor {
         observerRunSource = nil
     }
 
-    // MARK: - Text Input Detection
-
-    private func isTextInput(role: String, subrole: String, element: AXUIElement) -> Bool {
-        switch role {
-        case "AXTextField", "AXTextArea", "AXComboBox":
-            return true
-        case "AXStaticText", "AXButton", "AXImage", "AXMenu", "AXMenuItem",
-             "AXMenuBar", "AXMenuBarItem", "AXPopUpButton", "AXSplitGroup",
-             "AXScrollArea", "AXGroup", "AXRow", "AXColumn", "AXTable",
-             "AXList", "AXOutline", "AXBrowser", "AXTabGroup", "AXToolbar",
-             "AXDrawer", "AXSheet", "AXDockItem", "AXLink", "AXSlider",
-             "AXCheckBox", "AXRadioGroup", "AXRadioButton", "AXValueIndicator",
-             "AXDisclosureTriangle", "AXGrid", "AXGrowArea", "AXHandle",
-             "AXIncrementor", "AXLayoutArea", "AXLayoutItem", "AXLevelIndicator",
-             "AXMatte", "AXPopover", "AXRatingIndicator", "AXRelevanceIndicator",
-             "AXRuler", "AXRulerMarker", "AXTabButton", "AXTouchBar":
-            return false
-        default:
-            break
-        }
-
-        var editable: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(element, "AXEditable" as CFString, &editable)
-        if err == .success, let val = editable as? Bool, val == true {
-            return true
-        }
-
-        return false
-    }
-
-    /// 从 Electron/Web wrapper 元素递归查找文本输入框
-    private func findTextFieldIn(_ element: AXUIElement, depth: Int = 0) -> AXUIElement? {
-        guard depth < 8 else { return nil }  // 放宽深度限制
-
-        var children: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &children)
-        guard err == .success, let childArray = children as? [AXUIElement] else { return nil }
-
-        if depth < 3 {
-            NSLog("[SwiftFloat] findTextField: depth=\(depth), scanning \(childArray.count) children of \(element)")
-        }
-
-        for child in childArray {
-            var role: CFTypeRef?
-            var subrole: CFTypeRef?
-            AXUIElementCopyAttributeValue(child, kAXRoleAttribute as CFString, &role)
-            AXUIElementCopyAttributeValue(child, kAXSubroleAttribute as CFString, &subrole)
-            let roleStr = (role as? String) ?? "?"
-            let subroleStr = (subrole as? String) ?? "?"
-
-            if depth < 2 {
-                NSLog("[SwiftFloat] findTextField: child role=\(roleStr) subrole=\(subroleStr)")
-            }
-
-            // 直接可编辑的文本框
-            if roleStr == "AXTextField" || roleStr == "AXTextArea" || roleStr == "AXComboBox" {
-                var editable: CFTypeRef?
-                AXUIElementCopyAttributeValue(child, "AXEditable" as CFString, &editable)
-                if let val = editable as? Bool, val {
-                    NSLog("[SwiftFloat] findTextField: ✅ FOUND AXEditable \(roleStr)")
-                    return child
-                }
-            }
-
-            // 可编辑的静态文本
-            if roleStr == "AXStaticText" {
-                var editable: CFTypeRef?
-                AXUIElementCopyAttributeValue(child, "AXEditable" as CFString, &editable)
-                if let val = editable as? Bool, val {
-                    NSLog("[SwiftFloat] findTextField: ✅ FOUND AXEditable \(roleStr)")
-                    return child
-                }
-            }
-
-            // contenteditable div 通常没有 AXRole，用 AXValue 判断
-            var value: CFTypeRef?
-            AXUIElementCopyAttributeValue(child, kAXValueAttribute as CFString, &value)
-            if let str = value as? String, !str.isEmpty, roleStr != "?" {
-                // 有值且有 role，考虑为可编辑
-                NSLog("[SwiftFloat] findTextField: ✅ FOUND with value, role=\(roleStr) valueLen=\(str.count)")
-                return child
-            }
-
-            // 递归搜索子元素
-            if let found = findTextFieldIn(child, depth: depth + 1) {
-                return found
-            }
+    /// 读取选中文字
+    func getSelectedText(from element: AXUIElement) -> String? {
+        var selectedText: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &selectedText)
+        if err == .success, let text = selectedText as? String, !text.isEmpty {
+            return text
         }
         return nil
     }
 
-    // MARK: - Read AX Value
-
+    /// 读取输入框值
     private func getAXValue(_ element: AXUIElement) -> String {
         var value: CFTypeRef?
         var err = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value)
@@ -369,16 +357,27 @@ final class FocusMonitor {
         }
         return ""
     }
+}
 
-    /// 读取选中文字（供 AXObserver 回调和外部使用）
-    func getSelectedText(from element: AXUIElement) -> String? {
-        var selectedText: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &selectedText)
-        if err == .success, let text = selectedText as? String, !text.isEmpty {
-            return text
+// MARK: - CGEvent Tap Callback
+
+private func keyEventCallback(
+    proxy: CGEventTapProxy,
+    type: CGEventType,
+    event: CGEvent,
+    refcon: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    guard let refcon = refcon else { return Unmanaged.passRetained(event) }
+
+    let monitor = Unmanaged<FocusMonitor>.fromOpaque(refcon).takeUnretainedValue()
+
+    if type == .keyDown {
+        DispatchQueue.main.async {
+            monitor.handleKeyEvent(event)
         }
-        return nil
     }
+
+    return Unmanaged.passRetained(event)
 }
 
 // MARK: - AXObserver Callback
@@ -393,19 +392,15 @@ private func axObserverCallback(
 
     let monitor = Unmanaged<FocusMonitor>.fromOpaque(ctx).takeUnretainedValue()
 
-    // 确保在主线程
     DispatchQueue.main.async {
-        monitor.handleSelectionChanged(element: element)
+        monitor.handleAXNotification(element: element, notification: notification as String)
     }
 }
 
-// MARK: - Selection Handler Extension
+// MARK: - AX Notification Handler
 
 extension FocusMonitor {
-    /// AXObserver 回调：选中文字变化时触发
-    func handleSelectionChanged(element: AXUIElement) {
-        guard autoShowEnabled else { return }
-
+    func handleAXNotification(element: AXUIElement, notification: String) {
         // 跳过自身
         var pid: pid_t = 0
         AXUIElementGetPid(element, &pid)
@@ -415,12 +410,23 @@ extension FocusMonitor {
         let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? "unknown"
         if !watchedApps.isEmpty && !watchedApps.contains(bundleID) { return }
 
-        // 读取选中文字
+        switch notification {
+        case kAXSelectedTextChangedNotification as String:
+            handleSelectionChanged(element: element)
+        case kAXValueChangedNotification as String:
+            handleValueChanged(element: element, bundleID: bundleID)
+        default:
+            break
+        }
+    }
+
+    private func handleSelectionChanged(element: AXUIElement) {
         guard let selectedText = getSelectedText(from: element), !selectedText.isEmpty else {
+            // 选中文字消失 → 隐藏
+            hideIfNeeded()
             return
         }
 
-        // 获取光标位置（用于定位悬浮框）
         var position: CFTypeRef?
         let posErr = AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &position)
 
@@ -429,17 +435,30 @@ extension FocusMonitor {
         if posErr == .success, let posValue = position {
             var axPoint = CGPoint.zero
             if AXValueGetValue(posValue as! AXValue, .cgPoint, &axPoint) {
-                // AX 坐标是屏幕坐标，直接使用
                 mouseLoc = NSPoint(x: axPoint.x, y: axPoint.y)
             }
         }
 
-        NSLog("[SwiftFloat] AXObserver selection: \"\(selectedText.prefix(30))...\" at (\(mouseLoc.x), \(mouseLoc.y))")
+        NSLog("[SwiftFloat] AXObserver selection: \"\(selectedText.prefix(30))\" at (\(mouseLoc.x), \(mouseLoc.y))")
 
-        // 阻止 FocusMonitor 隐藏 2 秒
         suppressHide(seconds: 2)
 
-        // 显示悬浮框
         FloatWindowManager.shared.showForSelection(near: mouseLoc, selectedText: selectedText)
+    }
+
+    private func handleValueChanged(element: AXUIElement, bundleID: String) {
+        let fieldText = getAXValue(element)
+
+        if fieldText == "/" {
+            // 输入框恰好只有 "/" → 显示
+            NSLog("[SwiftFloat] AXObserver: slash-only detected in \(bundleID)")
+            let position = NSEvent.mouseLocation
+            SnippetStore.shared.switchApp(bundleID)
+            FloatWindowManager.shared.showForSlash(at: position, bundleID: bundleID)
+        } else if FloatWindowManager.shared.isSlashMode {
+            // 字段不再只有 "/" → 隐藏
+            NSLog("[SwiftFloat] AXObserver: field no longer slash-only, hiding. text='\(fieldText.prefix(20))'")
+            hideIfNeeded()
+        }
     }
 }

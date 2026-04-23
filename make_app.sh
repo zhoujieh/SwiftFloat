@@ -2,7 +2,7 @@
 set -e
 
 APP_NAME="SwiftFloat"
-BUILD_DIR="./.build/arm64-apple-macosx/debug"
+BUILD_DIR="./.build/release"
 SRCROOT="."
 
 # 创建 .app 目录结构

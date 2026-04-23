@@ -39,14 +39,25 @@ final class SelectionMonitor {
     /// 当前焦点 App 是否在白名单内（白名单为空 = 全部放行）
     private func isCurrentAppAllowed() -> Bool {
         guard !watchedApps.isEmpty else { return true }
+        
+        // 方法1：尝试从 AX API 获取焦点元素的 PID
         let systemWide = AXUIElementCreateSystemWide()
         var focusedElement: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement)
-        guard err == .success, let element = focusedElement else { return false }
-        var pid: pid_t = 0
-        AXUIElementGetPid((element as! AXUIElement), &pid)
-        if pid == ProcessInfo.processInfo.processIdentifier { return false }
-        let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? "unknown"
+        
+        if err == .success, let element = focusedElement {
+            var pid: pid_t = 0
+            AXUIElementGetPid((element as! AXUIElement), &pid)
+            if pid == ProcessInfo.processInfo.processIdentifier { return false }
+            let bundleID = NSRunningApplication(processIdentifier: pid)?.bundleIdentifier ?? "unknown"
+            NSLog("[SwiftFloat] isCurrentAppAllowed (AX): bundle=\(bundleID)")
+            return watchedApps.contains(bundleID)
+        }
+        
+        // 方法2：AX API 失败时，用 NSWorkspace 获取当前激活应用
+        let activeApp = NSWorkspace.shared.frontmostApplication
+        let bundleID = activeApp?.bundleIdentifier ?? "unknown"
+        NSLog("[SwiftFloat] isCurrentAppAllowed (Workspace): bundle=\(bundleID)")
         return watchedApps.contains(bundleID)
     }
 
@@ -82,7 +93,11 @@ final class SelectionMonitor {
 
     private func handleMouseEvent(_ event: NSEvent) {
         guard selectionShowEnabled else { return }
-        guard isCurrentAppAllowed() else { return }
+        let allowed = isCurrentAppAllowed()
+        if !allowed {
+            NSLog("[SwiftFloat] handleMouseEvent: app not allowed")
+        }
+        guard allowed else { return }
 
         switch event.type {
         case .leftMouseDown:
@@ -99,11 +114,13 @@ final class SelectionMonitor {
             let endPoint = NSEvent.mouseLocation
             let isDoubleClick = (event.clickCount == 2)
 
-            // 拖拽距离太小 且 不是双击 → 不是选择
+            // 拖拽距离太小 且 不是双击 → 检查是否是单击
             let dx = abs(endPoint.x - startPoint.x)
             let dy = abs(endPoint.y - startPoint.y)
             let isDrag = (dx > 10 || dy > 10)
-            guard isDrag || isDoubleClick else {
+            
+            if !isDrag && !isDoubleClick {
+                // 单击：不是选中文本操作
                 mouseDownPoint = nil
                 return
             }
@@ -111,22 +128,25 @@ final class SelectionMonitor {
             mouseDownPoint = nil
 
             // 延迟一小段时间让文本选择完成（双击/三击时系统需要时间处理）
-            let delay = isDoubleClick ? 0.05 : 0.0
+            let delay = isDoubleClick ? 0.1 : 0.05
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 // 优先用 AX API 读取选中文本（不会误触发 Finder 文件选择）
-                if let text = self.getSelectedText(), !text.isEmpty {
+                let axText = self.getSelectedText()
+                NSLog("[SwiftFloat] getSelectedText result: \(axText ?? "nil")")
+                
+                if let text = axText, !text.isEmpty {
                     let pos = isDrag ? endPoint : NSEvent.mouseLocation
                     self.showSelectionBubble(near: pos, selected: text)
                     return
                 }
 
                 // 兜底：模拟 Cmd+C 获取（某些 App 不暴露 AXSelectedText）
+                NSLog("[SwiftFloat] Falling back to simulateCopy")
                 self.simulateCopy { selectedText in
+                    NSLog("[SwiftFloat] simulateCopy result: \(selectedText ?? "nil")")
                     if let text = selectedText, !text.isEmpty {
-                        // 二次校验：确保焦点在文本元素上，不是文件/图标选择
-                        if self.isFocusedElementText() {
-                            self.showSelectionBubble(near: endPoint, selected: text)
-                        }
+                        // 直接显示，不做二次检查（simulateCopy 本身已是从选择触发）
+                        self.showSelectionBubble(near: endPoint, selected: text)
                     }
                 }
             }
@@ -141,7 +161,10 @@ final class SelectionMonitor {
         let systemWide = AXUIElementCreateSystemWide()
         var focusedElement: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &focusedElement)
-        guard err == .success, let element = focusedElement else { return false }
+        guard err == .success, let element = focusedElement else {
+            NSLog("[SwiftFloat] isFocusedElementText: failed to get focused element, err=\(err.rawValue)")
+            return false
+        }
         let axElement = element as! AXUIElement
 
         var pid: pid_t = 0
@@ -151,6 +174,8 @@ final class SelectionMonitor {
         var role: CFTypeRef?
         AXUIElementCopyAttributeValue(axElement, kAXRoleAttribute as CFString, &role)
         let roleStr = (role as? String) ?? ""
+        
+        NSLog("[SwiftFloat] isFocusedElementText: role=\(roleStr)")
 
         // Finder 文件列表的 role 是 AXOutline/AXList/AXRow，不是文本
         let textRoles = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField", "AXStaticText", "AXWebArea"]
@@ -213,9 +238,6 @@ final class SelectionMonitor {
 
         NSLog("[SwiftFloat] Selection detected, showing bubble at (\(point.x), \(point.y))")
 
-        // 阻止 FocusMonitor 隐藏悬浮球 2 秒
-        FocusMonitor.shared.suppressHide(seconds: 2)
-
         // 获取当前 App bundle ID
         var bundleID = "default"
         let systemWide = AXUIElementCreateSystemWide()
@@ -235,6 +257,7 @@ final class SelectionMonitor {
     private func simulateCopy(completion: @escaping (String?) -> Void) {
         let pasteboard = NSPasteboard.general
         let savedString = pasteboard.string(forType: .string)
+        NSLog("[SwiftFloat] simulateCopy: saved clipboard=\(savedString ?? "nil")")
         pasteboard.clearContents()
 
         // 模拟 Cmd+C
@@ -246,9 +269,10 @@ final class SelectionMonitor {
         down?.post(tap: .cghidEventTap)
         up?.post(tap: .cghidEventTap)
 
-        // 等待剪贴板更新
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        // 等待剪贴板更新（增加到 0.3 秒）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             let copied = pasteboard.string(forType: .string)
+            NSLog("[SwiftFloat] simulateCopy: copied=\(copied ?? "nil")")
             
             // 恢复剪贴板
             if let saved = savedString {

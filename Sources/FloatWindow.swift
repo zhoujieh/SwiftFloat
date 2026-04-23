@@ -1,4 +1,5 @@
 import AppKit
+import ApplicationServices
 
 // MARK: - FloatWindow
 
@@ -442,28 +443,29 @@ final class FloatWindowManager {
     private var window: FloatWindow?
     private var isShown = false
     private var clickOutsideMonitor: Any?
+    private(set) var isSlashMode = false  // slash command 模式
 
     var isVisible: Bool { isShown }
     var windowFrame: NSRect? { window?.frame }
 
     private init() {}
 
-    func toggle(at point: NSPoint) {
-        if isShown {
-            hide()
-        } else {
-            show(at: point)
+    func hide() {
+        window?.orderOut(nil)
+        isShown = false
+        isSlashMode = false
+        if let monitor = clickOutsideMonitor {
+            NSEvent.removeMonitor(monitor)
+            clickOutsideMonitor = nil
         }
     }
 
+    /// 手动显示（菜单栏触发）
     func show(at point: NSPoint) {
         if window == nil {
             window = FloatWindow()
         }
-
         guard let win = window else { return }
-
-        // 每次显示时用当前 App 的 snippets 重建按钮
         win.rebuildButtons(SnippetStore.shared.snippets)
 
         let windowW: CGFloat = 240
@@ -482,22 +484,59 @@ final class FloatWindowManager {
         win.setFrameOrigin(NSPoint(x: originX, y: originY))
         win.orderFront(nil)
         win.orderFrontRegardless()
-
         isShown = true
-    }
 
-    func hide() {
-        window?.orderOut(nil)
-        isShown = false
-        // 移除点击监听
-        if let monitor = clickOutsideMonitor {
-            NSEvent.removeMonitor(monitor)
-            clickOutsideMonitor = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.startClickOutsideMonitor()
         }
     }
 
-    /// 框选文本后显示：带复制按钮 + snippets
+    func toggle(at point: NSPoint) {
+        if isShown {
+            hide()
+        } else {
+            show(at: point)
+        }
+    }
+
+    /// 输入框只有 "/" 时显示（slash command 模式）
+    func showForSlash(at point: NSPoint, bundleID: String = "default") {
+        isSlashMode = true
+
+        if window == nil {
+            window = FloatWindow()
+        }
+        guard let win = window else { return }
+        win.currentBundleID = bundleID
+        win.rebuildButtons(SnippetStore.shared.snippets)
+
+        let windowW: CGFloat = 240
+        let windowH = win.frame.height
+
+        var originX = point.x - windowW / 2
+        var originY = point.y + 20
+
+        let targetScreen = NSScreen.screens.first(where: { NSMouseInRect(point, $0.frame, false) }) ?? NSScreen.main
+        if let screen = targetScreen {
+            let vf = screen.visibleFrame
+            originX = min(max(originX, vf.minX), vf.maxX - windowW)
+            originY = min(max(originY, vf.minY), vf.minY + vf.height - windowH)
+        }
+
+        win.setFrameOrigin(NSPoint(x: originX, y: originY))
+        win.orderFront(nil)
+        win.orderFrontRegardless()
+        isShown = true
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.startClickOutsideMonitor()
+        }
+    }
+
+    /// 划选文本后显示
     func showForSelection(near point: NSPoint, selectedText: String?, bundleID: String = "default") {
+        isSlashMode = false
+
         if window == nil {
             window = FloatWindow()
         }
@@ -526,14 +565,12 @@ final class FloatWindowManager {
         win.orderFrontRegardless()
         isShown = true
 
-        // 添加点击窗口外关闭的监听（延迟 0.3s 避免立即触发）
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             self?.startClickOutsideMonitor()
         }
     }
 
     private func startClickOutsideMonitor() {
-        // 先移除旧的
         if let monitor = clickOutsideMonitor {
             NSEvent.removeMonitor(monitor)
         }
@@ -542,6 +579,7 @@ final class FloatWindowManager {
             guard let self = self, let win = self.window, self.isShown else { return }
             let mouseLoc = NSEvent.mouseLocation
             if !win.frame.contains(mouseLoc) {
+                NSLog("[SwiftFloat] Click outside, hiding")
                 self.hide()
             }
         }
