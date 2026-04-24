@@ -125,15 +125,12 @@ final class FocusMonitor {
     }
 
     /// CGEvent tap 回调：检测 "/" 键（Electron 应用用）
-    func handleKeyEvent(_ event: CGEvent) {
+    /// 接收从 keyEventCallback 同步提取的 keyCode 和 chars，避免异步引用 CGEvent
+    func handleKeyEvent(keyCode: Int64, chars: String) {
         let activeApp = NSWorkspace.shared.frontmostApplication
         let bundleID = activeApp?.bundleIdentifier ?? "unknown"
 
         guard watchedApps.contains(bundleID) else { return }
-
-        let nsEvent = NSEvent(cgEvent: event)
-        let chars = nsEvent?.charactersIgnoringModifiers ?? ""
-        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
 
         // 检测 "/" 键
         if chars == "/" || keyCode == 44 {
@@ -343,18 +340,15 @@ final class FocusMonitor {
         return nil
     }
 
-    /// 读取输入框值
+    /// 读取输入框值（仅 kAXValueAttribute，不 fallback 到 selectedText）
     private func getAXValue(_ element: AXUIElement) -> String {
         var value: CFTypeRef?
-        var err = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value)
+        let err = AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &value)
         if err == .success, let str = value as? String {
             return str
         }
-        var selectedText: CFTypeRef?
-        err = AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &selectedText)
-        if err == .success, let str = selectedText as? String {
-            return str
-        }
+        // 不 fallback 到 kAXSelectedTextAttribute：selectedText 是选中的子串，不是字段值
+        // AX 获取字段值失败时返回空字符串，Electron 应用由 CGEvent tap 处理
         return ""
     }
 }
@@ -367,17 +361,20 @@ private func keyEventCallback(
     event: CGEvent,
     refcon: UnsafeMutableRawPointer?
 ) -> Unmanaged<CGEvent>? {
-    guard let refcon = refcon else { return Unmanaged.passRetained(event) }
+    guard let refcon = refcon else { return Unmanaged.passUnretained(event) }
 
     let monitor = Unmanaged<FocusMonitor>.fromOpaque(refcon).takeUnretainedValue()
 
     if type == .keyDown {
+        // 同步提取值，避免异步引用 CGEvent 导致悬垂引用
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        let chars = NSEvent(cgEvent: event)?.charactersIgnoringModifiers ?? ""
         DispatchQueue.main.async {
-            monitor.handleKeyEvent(event)
+            monitor.handleKeyEvent(keyCode: keyCode, chars: chars)
         }
     }
 
-    return Unmanaged.passRetained(event)
+    return Unmanaged.passUnretained(event)
 }
 
 // MARK: - AXObserver Callback
