@@ -14,6 +14,8 @@ struct Snippet: Codable, Identifiable {
 final class SnippetStore {
     static let shared = SnippetStore()
 
+    private(set) var watchedApps: [String] = []
+
     /// 按 bundleID 分组的 snippets,key = bundleID,"default" = 兜底
     private(set) var appSnippets: [String: [Snippet]] = [:]
 
@@ -32,6 +34,7 @@ final class SnippetStore {
     private var fileWatcherFD: Int32 = -1
 
     private init() {
+        loadWatchedApps()
         load()
         startFileWatcher()
     }
@@ -39,6 +42,22 @@ final class SnippetStore {
     private var configURL: URL {
         let base = FileManager.default.homeDirectoryForCurrentUser
         return base.appendingPathComponent(".config/swiftfloat/snippets.json")
+    }
+
+    private var appsConfigURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/swiftfloat/apps.json")
+    }
+
+    /// 加载应用白名单（统一入口，其他模块从这里读取）
+    func loadWatchedApps() {
+        guard FileManager.default.fileExists(atPath: appsConfigURL.path),
+              let data = try? Data(contentsOf: appsConfigURL),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return
+        }
+        watchedApps = obj["apps"] as? [String] ?? []
+        NSLog("[SwiftFloat] watchedApps loaded: \(watchedApps)")
     }
 
     /// 切换当前 App,返回 snippets 是否有变化
@@ -251,15 +270,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startFocusMonitor() {
-        FocusMonitor.shared.start()
-
-        // 选中文本监控
-        SelectionMonitor.shared.start()
+        // 统一输入层
+        InputContext.shared.onTrigger = { [weak self] context in
+            self?.handleTrigger(context)
+        }
+        InputContext.shared.start()
 
         // snippets.json 被外部修改时自动刷新 UI
         SnippetStore.shared.onConfigChanged = {
             FloatWindowManager.shared.rebuildIfNeeded()
-            FocusMonitor.shared.reloadConfig()
+        }
+    }
+
+    private func handleTrigger(_ context: TriggerContext) {
+        switch context.type {
+        case .slash:
+            FloatWindowManager.shared.showForSlash(at: context.position, bundleID: context.bundleID)
+        case .selection:
+            FloatWindowManager.shared.showForSelection(
+                near: context.position,
+                selectedText: context.selectedText,
+                bundleID: context.bundleID
+            )
         }
     }
 
@@ -271,8 +303,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func reloadSnippets() {
         SnippetStore.shared.reload()
-        FocusMonitor.shared.reloadConfig()
+        SnippetStore.shared.loadWatchedApps()
         FloatWindowManager.shared.rebuildIfNeeded()
-        NSLog("[SwiftFloat] Config reloaded. watchedApps=\(FocusMonitor.shared.watchedApps)")
+        NSLog("[SwiftFloat] Config reloaded. watchedApps=\(SnippetStore.shared.watchedApps)")
     }
 }

@@ -9,3 +9,6 @@ DerivedData/
 
 # Build artifacts
 bin/SwiftFloat
+.build/
+.SwiftFloat
+Sources/SwiftFloat

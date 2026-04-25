@@ -4,16 +4,17 @@ import ApplicationServices
 // MARK: - FloatWindow
 
 final class FloatWindow: NSPanel {
-    private var snippetButtons: [NSButton] = []
-    private var addFormView: NSView?
-    private var isAddFormOpen = false
-    private var editingSnippetId: String? = nil  // 非 nil 表示编辑模式
-    private var selectedText: String? = nil  // 当前选中文本（存入词库用）
-    var currentBundleID: String = "default"  // 当前 App bundle ID（快捷添加时用）
+    private var selectedText: String?
+    var currentBundleID: String = "default"
     private var escapeMonitor: Any?
-    private var clickMonitor: Any?
-
     private let container = NSView()
+
+    // 当前显示模式
+    private enum DisplayMode {
+        case slash       // slash command → snippet 列表
+        case selection   // 划词 → 操作列表
+    }
+    private var displayMode: DisplayMode = .slash
 
     init() {
         super.init(
@@ -36,7 +37,6 @@ final class FloatWindow: NSPanel {
     }
 
     private func setupCancelHandlers() {
-        // Escape 取消
         escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             if event.keyCode == 53 {  // Escape
                 DispatchQueue.main.async {
@@ -56,15 +56,16 @@ final class FloatWindow: NSPanel {
         contentView.wantsLayer = true
         contentView.layer?.cornerRadius = 10
         contentView.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.95).cgColor
-
         contentView.addSubview(container)
-        rebuildButtons(SnippetStore.shared.snippets)
     }
 
-    func rebuildButtons(_ snippets: [Snippet]) {
-        container.subviews.forEach { $0.removeFromSuperview() }
-        snippetButtons.removeAll()
+    // MARK: - Build Slash View (snippet 列表)
 
+    func buildSlashView() {
+        displayMode = .slash
+        container.subviews.forEach { $0.removeFromSuperview() }
+
+        let snippets = SnippetStore.shared.snippets
         let windowW: CGFloat = 240
         let paddingX: CGFloat = 8
         let paddingY: CGFloat = 6
@@ -100,7 +101,7 @@ final class FloatWindow: NSPanel {
         container.addSubview(separator)
         y += 6
 
-        // Snippet 按钮 + 删除/编辑
+        // Snippet 按钮
         for snippet in snippets {
             let btnW = contentW - 44
             let btn = NSButton(frame: NSRect(x: paddingX, y: y, width: btnW, height: rowH))
@@ -113,8 +114,8 @@ final class FloatWindow: NSPanel {
             btn.target = self
             btn.action = #selector(snippetClicked(_:))
             btn.toolTip = snippet.text
+            // ✅ 使用 identifier 匹配，不再用 title
             btn.identifier = NSUserInterfaceItemIdentifier(snippet.id)
-            snippetButtons.append(btn)
             container.addSubview(btn)
 
             // 删除按钮
@@ -158,43 +159,26 @@ final class FloatWindow: NSPanel {
         container.addSubview(addBtn)
         y += rowH + spacing
 
-        // 内联表单（默认隐藏）
+        // 内联表单
         let formH: CGFloat = 90
         let formView = buildAddForm(x: paddingX, y: y, w: contentW, h: formH)
-        formView.isHidden = !isAddFormOpen
+        formView.isHidden = true
         container.addSubview(formView)
         addFormView = formView
-        if isAddFormOpen {
-            clearAddFormFields()
-            y += formH + spacing
-        }
 
         y += paddingY
 
-        // 设置容器和窗口大小
-        let totalH = y
-        container.frame = NSRect(x: 0, y: 0, width: windowW, height: totalH)
-
-        let minH: CGFloat = 60
-        let maxH: CGFloat = 300
-        let newH = min(max(totalH, minH), maxH)
-
-        var rect = frame
-        rect.size.width = windowW
-        rect.size.height = newH
-        setFrame(rect, display: true)
-
-        NSLog("[SwiftFloat] rebuildButtons: \(snippets.count) snippets, windowH=\(newH)")
+        layoutContainer(width: windowW, height: y)
     }
 
-    /// 框选文本后显示：预览 + 快捷添加按钮
-    func rebuildWithSelection(_ text: String?) {
-        container.subviews.forEach { $0.removeFromSuperview() }
-        snippetButtons.removeAll()
-        isAddFormOpen = false
-        editingSnippetId = nil
-        selectedText = text  // 存起来给「快捷添加」用
+    // MARK: - Build Selection View (划词操作列表)
 
+    func buildSelectionView(text: String?) {
+        displayMode = .selection
+        selectedText = text
+        container.subviews.forEach { $0.removeFromSuperview() }
+
+        let actions = SelectionActionStore.shared.actions
         let windowW: CGFloat = 240
         let paddingX: CGFloat = 12
         let paddingY: CGFloat = 10
@@ -203,7 +187,7 @@ final class FloatWindow: NSPanel {
 
         var y = paddingY
 
-        // 标题 + 关闭按钮
+        // 标题 + 关闭
         let titleLabel = NSTextField(labelWithString: "已选中")
         titleLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         titleLabel.textColor = .secondaryLabelColor
@@ -221,7 +205,7 @@ final class FloatWindow: NSPanel {
         container.addSubview(closeBtn)
         y += 24
 
-        // 文本预览（最多 60 字符）
+        // 文本预览
         let previewText = text ?? "(无内容)"
         let preview = NSTextField(labelWithString: String(previewText.prefix(60)))
         preview.font = NSFont.systemFont(ofSize: 13)
@@ -232,64 +216,54 @@ final class FloatWindow: NSPanel {
         container.addSubview(preview)
         y += 24
 
-        // 快捷添加按钮
-        let addBtn = NSButton(frame: NSRect(x: paddingX, y: y, width: contentW, height: rowH))
-        addBtn.title = "＋ 快捷添加"
-        addBtn.bezelStyle = .rounded
-        addBtn.font = NSFont.systemFont(ofSize: 13, weight: .medium)
-        addBtn.alignment = .center
-        addBtn.contentTintColor = .controlAccentColor
-        addBtn.target = self
-        addBtn.action = #selector(quickAddSelectedText)
-        container.addSubview(addBtn)
-        y += rowH + paddingY
+        // 分隔线
+        let separator = NSView(frame: NSRect(x: paddingX, y: y, width: contentW, height: 0.5))
+        separator.wantsLayer = true
+        separator.layer?.backgroundColor = NSColor.separatorColor.cgColor
+        container.addSubview(separator)
+        y += 6
+
+        // 操作按钮列表
+        for action in actions {
+            let btn = NSButton(frame: NSRect(x: paddingX, y: y, width: contentW, height: rowH))
+            btn.title = action.label
+            btn.bezelStyle = .rounded
+            btn.font = NSFont.systemFont(ofSize: 13)
+            btn.alignment = .left
+            btn.wantsLayer = true
+            btn.layer?.cornerRadius = 5
+            btn.target = self
+            btn.action = #selector(actionClicked(_:))
+            btn.identifier = NSUserInterfaceItemIdentifier(action.id)
+            btn.toolTip = action.label
+            container.addSubview(btn)
+            y += rowH + 2
+        }
 
         y += paddingY
 
-        // 设置容器和窗口大小
-        let totalH = y
-        container.frame = NSRect(x: 0, y: 0, width: windowW, height: totalH)
+        layoutContainer(width: windowW, height: y)
+    }
 
-        let minH: CGFloat = 80
-        let newH = max(totalH, minH)
+    // MARK: - Layout Helper
+
+    private func layoutContainer(width: CGFloat, height: CGFloat) {
+        container.frame = NSRect(x: 0, y: 0, width: width, height: height)
+        let minH: CGFloat = 60
+        let maxH: CGFloat = 400
+        let newH = min(max(height, minH), maxH)
 
         var rect = frame
-        rect.size.width = windowW
+        rect.size.width = width
         rect.size.height = newH
         setFrame(rect, display: true)
-
-        NSLog("[SwiftFloat] rebuildWithSelection: preview=\(previewText.prefix(20)), windowH=\(newH)")
-    }
-
-    /// 快捷添加：直接存入词库并关闭
-    @objc private func quickAddSelectedText() {
-        guard let text = selectedText, !text.isEmpty else {
-            NSLog("[SwiftFloat] quickAdd: no text")
-            return
-        }
-        // 生成标签：取前 10 个字符
-        let label = String(text.prefix(10).replacingOccurrences(of: "\n", with: " "))
-        let app = currentBundleID
-        SnippetStore.shared.addSnippet(label: label, text: text, app: app)
-        NSLog("[SwiftFloat] quickAdd: saved \"\(label)\" to [\(app)]")
-        NSLog("[SwiftFloat] quickAdd: saved \"\(label)\"")
-        hideWindow()
-    }
-
-    @objc private func copySelectedText(_ sender: NSButton) {
-        guard let text = sender.identifier?.rawValue else { return }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
-        FloatWindowManager.shared.hide()
-    }
-
-    @objc private func hideWindow() {
-        isAddFormOpen = false
-        FloatWindowManager.shared.hide()
     }
 
     // MARK: - Add Form
+
+    private var addFormView: NSView?
+    private var isAddFormOpen = false
+    private var editingSnippetId: String? = nil
 
     private func buildAddForm(x: CGFloat, y: CGFloat, w: CGFloat, h: CGFloat) -> NSView {
         let form = NSView(frame: NSRect(x: x, y: y, width: w, height: h))
@@ -300,7 +274,6 @@ final class FloatWindow: NSPanel {
         let fieldW = w - 16
         let fieldX: CGFloat = 8
 
-        // 标签输入框
         let labelField = NSTextField(frame: NSRect(x: fieldX, y: h - 30, width: fieldW, height: 22))
         labelField.placeholderString = "标签（如：代码审查）"
         labelField.font = NSFont.systemFont(ofSize: 12)
@@ -308,7 +281,6 @@ final class FloatWindow: NSPanel {
         labelField.identifier = NSUserInterfaceItemIdentifier("addLabel")
         form.addSubview(labelField)
 
-        // 文本输入框
         let textField = NSTextField(frame: NSRect(x: fieldX, y: h - 60, width: fieldW, height: 22))
         textField.placeholderString = "提示词内容"
         textField.font = NSFont.systemFont(ofSize: 12)
@@ -316,7 +288,6 @@ final class FloatWindow: NSPanel {
         textField.identifier = NSUserInterfaceItemIdentifier("addText")
         form.addSubview(textField)
 
-        // 保存按钮
         let saveBtn = NSButton(frame: NSRect(x: fieldX, y: 6, width: fieldW, height: 22))
         saveBtn.title = "保存"
         saveBtn.bezelStyle = .rounded
@@ -331,17 +302,17 @@ final class FloatWindow: NSPanel {
 
     @objc private func toggleAddForm() {
         isAddFormOpen.toggle()
-        rebuildButtons(SnippetStore.shared.snippets)
-    }
-
-    private func clearAddFormFields() {
-        guard let form = container.subviews.first(where: { $0.subviews.contains(where: { ($0 as? NSTextField)?.identifier?.rawValue == "addLabel" }) }) else { return }
-        (form.subviews.first(where: { ($0 as? NSTextField)?.identifier?.rawValue == "addLabel" }) as? NSTextField)?.stringValue = ""
-        (form.subviews.first(where: { ($0 as? NSTextField)?.identifier?.rawValue == "addText" }) as? NSTextField)?.stringValue = ""
+        buildSlashView()
+        if isAddFormOpen, let form = addFormView {
+            form.isHidden = false
+            // 调整窗口高度
+            let currentH = container.frame.height
+            layoutContainer(width: 240, height: currentH + 92)
+        }
     }
 
     @objc private func saveNewSnippet() {
-        guard let form = container.subviews.first(where: { $0.subviews.contains(where: { ($0 as? NSTextField)?.identifier?.rawValue == "addLabel" }) }) else { return }
+        guard let form = addFormView else { return }
         let labelField = form.subviews.first(where: { ($0 as? NSTextField)?.identifier?.rawValue == "addLabel" }) as? NSTextField
         let textField  = form.subviews.first(where: { ($0 as? NSTextField)?.identifier?.rawValue == "addText" }) as? NSTextField
 
@@ -364,48 +335,103 @@ final class FloatWindow: NSPanel {
         }
 
         if let editId = editingSnippetId, !editId.isEmpty {
-            // 编辑模式：更新现有
             SnippetStore.shared.updateSnippet(id: editId, label: label, text: text)
         } else {
-            // 新增模式
             SnippetStore.shared.addSnippet(label: label, text: text)
         }
 
-        // 重置状态
         editingSnippetId = nil
         isAddFormOpen = false
-        rebuildButtons(SnippetStore.shared.snippets)
+        buildSlashView()
     }
 
+    // MARK: - Snippet Actions
+
+    /// ✅ 使用 identifier 匹配（不再用 title）
     @objc private func snippetClicked(_ sender: NSButton) {
-        guard let label = sender.title as String?,
-              let matched = SnippetStore.shared.snippets.first(where: { $0.label == label }) else { return }
+        guard let snippetId = sender.identifier?.rawValue,
+              let matched = SnippetStore.shared.snippets.first(where: { $0.id == snippetId }) else { return }
 
         FloatWindowManager.shared.hide()
-        insertText(matched.text)
+        ClipboardService.shared.insertText(matched.text)
     }
 
     @objc private func deleteSnippet(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue else { return }
         SnippetStore.shared.removeSnippet(id: id)
-        rebuildButtons(SnippetStore.shared.snippets)
+        buildSlashView()
     }
 
     @objc private func editSnippet(_ sender: NSButton) {
         guard let id = sender.identifier?.rawValue,
               let snippet = SnippetStore.shared.snippets.first(where: { $0.id == id }) else { return }
-        // 打开表单并填充现有值
+
         editingSnippetId = id
         isAddFormOpen = true
-        rebuildButtons(SnippetStore.shared.snippets)
+        buildSlashView()
+
         // 填充表单
-        if let form = container.subviews.first(where: { $0.subviews.contains(where: { ($0 as? NSTextField)?.identifier?.rawValue == "addLabel" }) }) {
+        if let form = addFormView {
             (form.subviews.first(where: { ($0 as? NSTextField)?.identifier?.rawValue == "addLabel" }) as? NSTextField)?.stringValue = snippet.label
             (form.subviews.first(where: { ($0 as? NSTextField)?.identifier?.rawValue == "addText" }) as? NSTextField)?.stringValue = snippet.text
+            form.isHidden = false
         }
     }
 
-    private func insertText(_ text: String) {
+    // MARK: - Selection Actions
+
+    @objc private func actionClicked(_ sender: NSButton) {
+        guard let actionId = sender.identifier?.rawValue else { return }
+        let actions = SelectionActionStore.shared.actions
+        guard let action = actions.first(where: { $0.id == actionId }) else { return }
+
+        guard let text = selectedText, !text.isEmpty else { return }
+
+        FloatWindowManager.shared.hide()
+
+        switch action.actionType {
+        case .copy:
+            ClipboardService.shared.copyText(text)
+
+        case .quickAdd:
+            let label = String(text.prefix(10).replacingOccurrences(of: "\n", with: " "))
+            let app = currentBundleID
+            SnippetStore.shared.addSnippet(label: label, text: text, app: app)
+            NSLog("[FloatWindow] quickAdd: saved '\(label)' to [\(app)]")
+
+        case .translate:
+            let combined = (action.presetText ?? "") + text
+            ClipboardService.shared.insertText(combined)
+
+        case .insert:
+            let combined = (action.presetText ?? "") + text
+            ClipboardService.shared.insertText(combined)
+        }
+    }
+
+    @objc private func hideWindow() {
+        FloatWindowManager.shared.hide()
+    }
+}
+
+// MARK: - ClipboardService
+/// 统一剪贴板操作：消除 FloatWindow 里重复的剪贴板保存/恢复逻辑
+
+final class ClipboardService {
+    static let shared = ClipboardService()
+
+    private init() {}
+
+    /// 复制文本到剪贴板（不模拟粘贴）
+    func copyText(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        NSLog("[ClipboardService] copied: '\(text.prefix(20))'")
+    }
+
+    /// 插入文本到当前焦点输入框（剪贴板 → Cmd+V → 恢复剪贴板）
+    func insertText(_ text: String) {
         let pasteboard = NSPasteboard.general
         let previousContents = pasteboard.string(forType: .string)
         pasteboard.clearContents()
@@ -429,13 +455,13 @@ final class FloatWindow: NSPanel {
         vDown?.flags = .maskCommand
         let vUp = CGEvent(keyboardEventSource: src, virtualKey: 0x09, keyDown: false)
         vUp?.flags = .maskCommand
-
         vDown?.post(tap: .cghidEventTap)
         vUp?.post(tap: .cghidEventTap)
     }
 }
 
 // MARK: - FloatWindowManager
+/// 统一窗口管理：消除 show/showForSlash/showForSelection 中重复的窗口定位逻辑
 
 final class FloatWindowManager {
     static let shared = FloatWindowManager()
@@ -443,7 +469,7 @@ final class FloatWindowManager {
     private var window: FloatWindow?
     private var isShown = false
     private var clickOutsideMonitor: Any?
-    private(set) var isSlashMode = false  // slash command 模式
+    private(set) var isSlashMode = false
 
     var isVisible: Bool { isShown }
     var windowFrame: NSRect? { window?.frame }
@@ -462,33 +488,47 @@ final class FloatWindowManager {
 
     /// 手动显示（菜单栏触发）
     func show(at point: NSPoint) {
-        if window == nil {
-            window = FloatWindow()
-        }
+        ensureWindow()
         guard let win = window else { return }
-        win.rebuildButtons(SnippetStore.shared.snippets)
 
-        let windowW: CGFloat = 240
-        let windowH = win.frame.height
+        SnippetStore.shared.switchApp("default")
+        win.buildSlashView()
+        positionWindow(win, near: point)
 
-        var originX = point.x - windowW / 2
-        var originY = point.y + 20
-
-        let targetScreen = NSScreen.screens.first(where: { NSMouseInRect(point, $0.frame, false) }) ?? NSScreen.main
-        if let screen = targetScreen {
-            let vf = screen.visibleFrame
-            originX = min(max(originX, vf.minX), vf.maxX - windowW)
-            originY = min(max(originY, vf.minY), vf.minY + vf.height - windowH)
-        }
-
-        win.setFrameOrigin(NSPoint(x: originX, y: originY))
-        win.orderFront(nil)
-        win.orderFrontRegardless()
+        isSlashMode = false
         isShown = true
+        scheduleClickOutsideMonitor()
+    }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.startClickOutsideMonitor()
-        }
+    /// Slash 模式：输入框只有 "/" 时显示
+    func showForSlash(at point: NSPoint, bundleID: String = "default") {
+        ensureWindow()
+        guard let win = window else { return }
+
+        SnippetStore.shared.switchApp(bundleID)
+        win.currentBundleID = bundleID
+        win.buildSlashView()
+        positionWindow(win, near: point)
+
+        isSlashMode = true
+        isShown = true
+        scheduleClickOutsideMonitor()
+    }
+
+    /// 划词模式：选中文本后显示
+    func showForSelection(near point: NSPoint, selectedText: String?, bundleID: String = "default") {
+        ensureWindow()
+        guard let win = window else { return }
+
+        SnippetStore.shared.switchApp(bundleID)
+        SelectionActionStore.shared.switchApp(bundleID)
+        win.currentBundleID = bundleID
+        win.buildSelectionView(text: selectedText)
+        positionWindow(win, near: point)
+
+        isSlashMode = false
+        isShown = true
+        scheduleClickOutsideMonitor()
     }
 
     func toggle(at point: NSPoint) {
@@ -499,54 +539,24 @@ final class FloatWindowManager {
         }
     }
 
-    /// 输入框只有 "/" 时显示（slash command 模式）
-    func showForSlash(at point: NSPoint, bundleID: String = "default") {
-        isSlashMode = true
+    func rebuildIfNeeded() {
+        guard let win = window, isShown else { return }
+        if isSlashMode {
+            win.buildSlashView()
+        }
+        // selection 模式不 rebuild（操作列表固定）
+    }
 
+    // MARK: - Private Helpers
+
+    private func ensureWindow() {
         if window == nil {
             window = FloatWindow()
-        }
-        guard let win = window else { return }
-        win.currentBundleID = bundleID
-        win.rebuildButtons(SnippetStore.shared.snippets)
-
-        let windowW: CGFloat = 240
-        let windowH = win.frame.height
-
-        var originX = point.x - windowW / 2
-        var originY = point.y + 20
-
-        let targetScreen = NSScreen.screens.first(where: { NSMouseInRect(point, $0.frame, false) }) ?? NSScreen.main
-        if let screen = targetScreen {
-            let vf = screen.visibleFrame
-            originX = min(max(originX, vf.minX), vf.maxX - windowW)
-            originY = min(max(originY, vf.minY), vf.minY + vf.height - windowH)
-        }
-
-        win.setFrameOrigin(NSPoint(x: originX, y: originY))
-        win.orderFront(nil)
-        win.orderFrontRegardless()
-        isShown = true
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.startClickOutsideMonitor()
         }
     }
 
-    /// 划选文本后显示
-    func showForSelection(near point: NSPoint, selectedText: String?, bundleID: String = "default") {
-        isSlashMode = false
-
-        if window == nil {
-            window = FloatWindow()
-        }
-
-        guard let win = window else { return }
-        win.currentBundleID = bundleID
-
-        // 重建按钮 + 复制当前选中
-        win.rebuildWithSelection(selectedText)
-
+    /// ✅ 统一窗口定位逻辑（消除原来 3 处重复代码）
+    private func positionWindow(_ win: FloatWindow, near point: NSPoint) {
         let windowW: CGFloat = 240
         let windowH = win.frame.height
 
@@ -563,30 +573,25 @@ final class FloatWindowManager {
         win.setFrameOrigin(NSPoint(x: originX, y: originY))
         win.orderFront(nil)
         win.orderFrontRegardless()
-        isShown = true
+    }
 
+    private func scheduleClickOutsideMonitor() {
+        if let monitor = clickOutsideMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
             self?.startClickOutsideMonitor()
         }
     }
 
     private func startClickOutsideMonitor() {
-        if let monitor = clickOutsideMonitor {
-            NSEvent.removeMonitor(monitor)
-        }
-
         clickOutsideMonitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in
             guard let self = self, let win = self.window, self.isShown else { return }
             let mouseLoc = NSEvent.mouseLocation
             if !win.frame.contains(mouseLoc) {
-                NSLog("[SwiftFloat] Click outside, hiding")
+                NSLog("[FloatWindowManager] Click outside, hiding")
                 self.hide()
             }
         }
-    }
-
-    func rebuildIfNeeded() {
-        guard let win = window, isShown else { return }
-        win.rebuildButtons(SnippetStore.shared.snippets)
     }
 }

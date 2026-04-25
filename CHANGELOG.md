@@ -2,6 +2,37 @@
 
 All notable changes to SwiftFloat will be documented in this file.
 
+## [0.3.0] - 2026-04-25
+
+### Added
+- `InputContext.swift`：统一输入监控层，替代 FocusMonitor + SelectionMonitor 并行运行的双监控架构
+  - AXObserver：监听焦点元素的 kAXValueChangedNotification（slash 检测）和 kAXSelectedTextChangedNotification（划词检测）
+  - CGEvent Tap：Electron 应用的键盘 fallback，检测 "/" 键
+  - Mouse Monitor：鼠标拖拽/双击 → simulateCopy 获取选中文本
+  - 统一 TriggerContext 封装两种触发路径（.slash / .selection）
+- `SelectionAction.swift`：划词模式操作定义（ActionType: copy / translate / quickAdd / insert）
+- `SelectionActionStore`：按 App 分组的划词操作列表，支持 actions.json 配置
+- AppDelegate 新增 `handleTrigger(_:)` 统一派发 TriggerContext
+- `SnippetStore` 新增 `watchedApps` 属性（从 apps.json 加载，统一配置入口）
+
+### Changed
+- `AppDelegate.startFocusMonitor()`：不再调用 FocusMonitor/SelectionMonitor，改为启动 InputContext 统一监控层
+- `FloatWindow`：
+  - `rebuildButtons()` → `buildSlashView()`（snippet 列表视图）
+  - `rebuildWithSelection()` → `buildSelectionView()`（划词操作列表视图）
+  - `displayMode` enum 替代 isAddFormOpen / editingSnippetId 等分散状态
+  - 新增 `layoutContainer()` 统一窗口尺寸计算，消除重复代码
+- `FloatWindowManager`：
+  - 新增 `ensureWindow()` / `positionWindow(near:)` / `scheduleClickOutsideMonitor()` 私有方法，消除 show/showForSlash/showForSelection 三处重复定位逻辑
+  - `rebuildIfNeeded()`：slash 模式下 rebuild，selection 模式保持不变（操作列表固定）
+- 配置文件路径统一：`~/.config/swiftfloat/apps.json` 作为 watchedApps 唯一数据源
+
+### Removed
+- FocusMonitor / SelectionMonitor 的独立事件监听（两者被 InputContext 统一替代，不再并行运行）
+- FocusMonitor.watchedApps（由 SnippetStore.watchedApps 统一替代）
+- FocusMonitor.reloadConfig()（由 SnippetStore.loadWatchedApps() 替代）
+- AppDelegate 中的冗余状态变量（lastFocusedElementID 等历史追踪字段）
+
 ## [0.2.0] - 2026-04-24
 
 ### Added
