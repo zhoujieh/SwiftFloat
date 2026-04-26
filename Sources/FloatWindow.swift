@@ -83,6 +83,17 @@ final class FloatWindow: NSPanel {
         titleLabel.setFrameOrigin(NSPoint(x: paddingX, y: y + 3))
         container.addSubview(titleLabel)
 
+        // 禁用/启用此 App 按钮
+        let blocked = SnippetStore.shared.isAppBlocked(currentBundleID)
+        let disableBtn = NSButton(title: blocked ? "启用" : "禁用", target: self, action: #selector(toggleAppBlocked))
+        disableBtn.bezelStyle = .inline
+        disableBtn.isBordered = false
+        disableBtn.font = NSFont.systemFont(ofSize: 11)
+        disableBtn.contentTintColor = blocked ? .systemGreen : .systemRed
+        disableBtn.sizeToFit()
+        disableBtn.setFrameOrigin(NSPoint(x: windowW - paddingX - disableBtn.frame.width - 4 - 24, y: y + 1))
+        container.addSubview(disableBtn)
+
         let closeBtn = NSButton(title: "✕", target: self, action: #selector(hideWindow))
         closeBtn.bezelStyle = .inline
         closeBtn.isBordered = false
@@ -194,6 +205,17 @@ final class FloatWindow: NSPanel {
         titleLabel.sizeToFit()
         titleLabel.setFrameOrigin(NSPoint(x: paddingX, y: y + 4))
         container.addSubview(titleLabel)
+
+        // 禁用/启用此 App 按钮
+        let blocked = SnippetStore.shared.isAppBlocked(currentBundleID)
+        let disableBtn = NSButton(title: blocked ? "启用" : "禁用", target: self, action: #selector(toggleAppBlocked))
+        disableBtn.bezelStyle = .inline
+        disableBtn.isBordered = false
+        disableBtn.font = NSFont.systemFont(ofSize: 11)
+        disableBtn.contentTintColor = blocked ? .systemGreen : .systemRed
+        disableBtn.sizeToFit()
+        disableBtn.setFrameOrigin(NSPoint(x: windowW - paddingX - disableBtn.frame.width - 4 - 24, y: y + 2))
+        container.addSubview(disableBtn)
 
         let closeBtn = NSButton(title: "✕", target: self, action: #selector(hideWindow))
         closeBtn.bezelStyle = .inline
@@ -406,6 +428,25 @@ final class FloatWindow: NSPanel {
         case .insert:
             let combined = (action.presetText ?? "") + text
             ClipboardService.shared.insertText(combined)
+        }
+    }
+
+    @objc private func toggleAppBlocked() {
+        let bundleID = currentBundleID
+        if SnippetStore.shared.isAppBlocked(bundleID) {
+            SnippetStore.shared.unblockApp(bundleID)
+        } else {
+            SnippetStore.shared.blockApp(bundleID)
+        }
+        // 重建视图以刷新按钮状态
+        if displayMode == .slash {
+            buildSlashView()
+        } else {
+            buildSelectionView(text: selectedText)
+        }
+        // 禁用后隐藏悬浮球
+        if SnippetStore.shared.isAppBlocked(bundleID) {
+            FloatWindowManager.shared.hide()
         }
     }
 

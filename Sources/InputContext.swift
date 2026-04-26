@@ -282,8 +282,8 @@ final class InputContext {
 
         let bundleID = NSRunningApplication(processIdentifier: elementPID)?.bundleIdentifier ?? ""
 
-        // 白名单检查
-        if !SnippetStore.shared.watchedApps.isEmpty && !SnippetStore.shared.watchedApps.contains(bundleID) {
+        // 被禁用 App 检查
+        if SnippetStore.shared.isAppBlocked(bundleID) {
             return
         }
 
@@ -401,8 +401,8 @@ final class InputContext {
 
         let bundleID = NSRunningApplication(processIdentifier: elementPID)?.bundleIdentifier ?? ""
 
-        // 白名单检查
-        if !SnippetStore.shared.watchedApps.isEmpty && !SnippetStore.shared.watchedApps.contains(bundleID) {
+        // 被禁用 App 检查
+        if SnippetStore.shared.isAppBlocked(bundleID) {
             return
         }
 
@@ -464,7 +464,8 @@ final class InputContext {
         let activeApp = NSWorkspace.shared.frontmostApplication
         let bundleID = activeApp?.bundleIdentifier ?? ""
 
-        guard SnippetStore.shared.watchedApps.contains(bundleID) else { return }
+        // 被禁用的 App 跳过 CGEvent 处理
+        guard !SnippetStore.shared.isAppBlocked(bundleID) else { return }
 
         // 尝试通过 AX 读取输入框当前内容（更可靠）
         let systemWide = AXUIElementCreateSystemWide()

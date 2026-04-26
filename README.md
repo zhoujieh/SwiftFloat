@@ -38,18 +38,19 @@
 
 ---
 
-## 应用白名单
+## 应用禁用列表
 
 配置 `~/.config/swiftfloat/apps.json`：
 
 ```json
 {
-  "apps": ["com.tencent.qclaw", "com.bytedance.lark", "com.apple.Safari"]
+  "blockedApps": ["com.apple.Finder", "com.apple.Terminal"]
 }
 ```
 
-- 白名单非空 → 仅白名单内 App 生效
-- 白名单为空 → 所有 App 均可触发
+- 默认为空 → 所有 App 均可触发
+- 列表中的 App 不触发悬浮球
+- 可在悬浮球内点击「禁用」/「启用」按钮即时切换
 
 ---
 

@@ -14,7 +14,8 @@ struct Snippet: Codable, Identifiable {
 final class SnippetStore {
     static let shared = SnippetStore()
 
-    private(set) var watchedApps: [String] = []
+    /// 被禁用的 App bundleID 列表（黑名单），为空时所有 App 生效
+    private(set) var blockedApps: [String] = []
 
     /// 按 bundleID 分组的 snippets,key = bundleID,"default" = 兜底
     private(set) var appSnippets: [String: [Snippet]] = [:]
@@ -34,7 +35,7 @@ final class SnippetStore {
     private var fileWatcherFD: Int32 = -1
 
     private init() {
-        loadWatchedApps()
+        loadBlockedApps()
         load()
         startFileWatcher()
     }
@@ -49,15 +50,49 @@ final class SnippetStore {
             .appendingPathComponent(".config/swiftfloat/apps.json")
     }
 
-    /// 加载应用白名单（统一入口，其他模块从这里读取）
-    func loadWatchedApps() {
+    /// 加载禁用 App 列表（黑名单），列表中的 App 不触发悬浮球
+    /// 为空时所有 App 生效
+    func loadBlockedApps() {
         guard FileManager.default.fileExists(atPath: appsConfigURL.path),
               let data = try? Data(contentsOf: appsConfigURL),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return
         }
-        watchedApps = obj["apps"] as? [String] ?? []
-        NSLog("[SwiftFloat] watchedApps loaded: \(watchedApps)")
+        blockedApps = obj["blockedApps"] as? [String] ?? []
+        NSLog("[SwiftFloat] blockedApps loaded: \(blockedApps)")
+    }
+
+    /// 检查指定 App 是否被禁用
+    func isAppBlocked(_ bundleID: String) -> Bool {
+        return blockedApps.contains(bundleID)
+    }
+
+    /// 禁用指定 App
+    func blockApp(_ bundleID: String) {
+        guard !blockedApps.contains(bundleID) else { return }
+        blockedApps.append(bundleID)
+        saveBlockedApps()
+        NSLog("[SwiftFloat] Blocked: \(bundleID)")
+    }
+
+    /// 取消禁用指定 App
+    func unblockApp(_ bundleID: String) {
+        guard blockedApps.contains(bundleID) else { return }
+        blockedApps.removeAll { $0 == bundleID }
+        saveBlockedApps()
+        NSLog("[SwiftFloat] Unblocked: \(bundleID)")
+    }
+
+    /// 持久化禁用列表
+    private func saveBlockedApps() {
+        ensureConfigDir()
+        let dict: [String: Any] = ["blockedApps": blockedApps]
+        do {
+            let data = try JSONSerialization.data(withJSONObject: dict, options: .prettyPrinted)
+            try data.write(to: appsConfigURL, options: .atomic)
+        } catch {
+            NSLog("[SwiftFloat] Save blockedApps failed: \(error)")
+        }
     }
 
     /// 切换当前 App,返回 snippets 是否有变化
@@ -303,8 +338,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func reloadSnippets() {
         SnippetStore.shared.reload()
-        SnippetStore.shared.loadWatchedApps()
+        SnippetStore.shared.loadBlockedApps()
         FloatWindowManager.shared.rebuildIfNeeded()
-        NSLog("[SwiftFloat] Config reloaded. watchedApps=\(SnippetStore.shared.watchedApps)")
+        NSLog("[SwiftFloat] Config reloaded. blockedApps=\(SnippetStore.shared.blockedApps)")
     }
 }
